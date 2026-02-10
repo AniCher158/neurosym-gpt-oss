@@ -146,8 +146,8 @@ def main():
 
     # LoRA configuration: target_modules tuned for Mistral
     lora_cfg = LoraConfig(
-        r=64,
-        lora_alpha=16,
+        r=16,
+        lora_alpha=32,
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
