@@ -19,19 +19,23 @@ from peft import LoraConfig, get_peft_model
 
 
 # ----------------------------
-# 1. Config dataclass
+# 1. Training configuration
 # ----------------------------
 
 @dataclass
-class LoRAConfig:
+@dataclass
+class TrainConfig:
     base_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"
     train_path: str = "data/neurosym_mix_train.jsonl"
     output_dir: str = "outputs/mistral7b_neurosym_lora"
-    max_seq_len: int = 1024
 
-    # QLoRA / training hyperparams tuned for 1× A10G (g5.xlarge)
-    per_device_batch_size: int = 1
-    gradient_accumulation_steps: int = 8
+    # On g5.xlarge, 2048 is usually OK with QLoRA 4-bit
+    max_seq_len: int = 2048
+
+    # Try batch 2 with some accumulation.
+    per_device_batch_size: int = 2
+    gradient_accumulation_steps: int = 8  # effective batch = 16
+
     learning_rate: float = 2e-4
     num_train_epochs: int = 3
     warmup_ratio: float = 0.03
@@ -48,14 +52,17 @@ class LoRAConfig:
 def format_messages(example):
     """
     Convert the messages list into a single training string.
-    We use a simple chat-style format; you can adjust later.
+    Very simple chat-style format.
     """
     msgs = example["messages"]
 
     lines = []
     for turn in msgs:
         role = turn["role"]
-        content = turn["content"].strip()
+        content = (turn["content"] or "").strip()
+        if not content:
+            continue
+
         if role == "system":
             lines.append(f"<|system|>\n{content}\n")
         elif role == "user":
@@ -63,11 +70,8 @@ def format_messages(example):
         elif role == "assistant":
             lines.append(f"<|assistant|>\n{content}\n")
         else:
-            # Unknown role, just dump
             lines.append(f"<|{role}|>\n{content}\n")
 
-    # For training, we want the model to predict the assistant text,
-    # but simplest baseline is plain causal LM loss over the full string.
     joined = "\n".join(lines).strip() + "\n"
     return joined
 
@@ -77,9 +81,12 @@ def format_messages(example):
 # ----------------------------
 
 class ChatJSONLDataset(Dataset):
-    def __init__(self, path, tokenizer, max_seq_len):
+    def __init__(self, path, tokenizer, max_seq_len: int):
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Train JSONL not found at: {path}")
 
         # Load JSONL with datasets
         self.ds = load_dataset("json", data_files={"train": path})["train"]
@@ -103,7 +110,7 @@ class ChatJSONLDataset(Dataset):
         input_ids = tokenized["input_ids"][0]
         attention_mask = tokenized["attention_mask"][0]
 
-        # For plain causal LM we can use labels = input_ids
+        # Plain causal LM: labels = input_ids
         return {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
@@ -116,14 +123,19 @@ class ChatJSONLDataset(Dataset):
 # ----------------------------
 
 def main():
-    cfg = LoRAConfig()
+    cfg = TrainConfig()
 
-    # BitsAndBytes 4-bit config
+    # Small memory tweaks
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    # QLoRA 4-bit config
+    # IMPORTANT: use float16 here (bfloat16 on T4/Colab is bad for memory
+    # and not fully supported).
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_compute_dtype=torch.float16,
     )
 
     print("Loading base model:", cfg.base_model_name)
@@ -144,10 +156,16 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # LoRA configuration: target_modules tuned for Mistral
+    # Optional: ensure embeddings match tokenizer size
+    model.resize_token_embeddings(len(tokenizer))
+
+    # ------------------------
+    # LoRA configuration
+    # ------------------------
+    # Larger r and lora_alpha than your previous version (more capacity).
     lora_cfg = LoraConfig(
-        r=16,
-        lora_alpha=32,
+        r=32,              # was 16
+        lora_alpha=64,     # was 32
         lora_dropout=0.05,
         bias="none",
         task_type="CAUSAL_LM",
@@ -165,6 +183,10 @@ def main():
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
+    # Enable gradient checkpointing to save memory
+    model.gradient_checkpointing_enable()
+    model.config.use_cache = False  # mandatory when using gradient checkpointing
+
     # Dataset
     train_dataset = ChatJSONLDataset(
         path=cfg.train_path,
@@ -177,7 +199,9 @@ def main():
         mlm=False,
     )
 
-    # Training arguments tuned for single A10G
+    # ------------------------
+    # Training arguments
+    # ------------------------
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.per_device_batch_size,
@@ -188,12 +212,13 @@ def main():
         weight_decay=cfg.weight_decay,
         logging_steps=cfg.logging_steps,
         save_steps=cfg.save_steps,
-        fp16=False,
-        bf16=True,              # A10G supports BF16
+        max_grad_norm=cfg.max_grad_norm,
+
+        fp16=True,     # use FP16 on Colab / most GPUs
+        bf16=False,    # do NOT use BF16 on T4-type GPUs
         optim="paged_adamw_8bit",
         lr_scheduler_type="cosine",
         report_to="none",       # or "wandb"
-        max_grad_norm=cfg.max_grad_norm,
     )
 
     trainer = Trainer(
@@ -205,7 +230,7 @@ def main():
 
     trainer.train()
 
-    # Save adapter
+    # Save adapter and tokenizer
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
     print("Saved LoRA adapter + tokenizer to", cfg.output_dir)
