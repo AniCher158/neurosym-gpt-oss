@@ -27,7 +27,8 @@ from peft import LoraConfig, get_peft_model
 class TrainConfig:
     base_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"
     train_path: str = "data/neurosym_mix_train.jsonl"
-    output_dir: str = "outputs/mistral7b_neurosym_lora"
+    output_dir: str = "/content/drive/MyDrive/neurosym_mistral_lora"
+
 
     # On g5.xlarge, 2048 is usually OK with QLoRA 4-bit
     max_seq_len: int = 2048
@@ -211,15 +212,21 @@ def main():
         warmup_ratio=cfg.warmup_ratio,
         weight_decay=cfg.weight_decay,
         logging_steps=cfg.logging_steps,
-        save_steps=cfg.save_steps,
-        max_grad_norm=cfg.max_grad_norm,
-
-        fp16=True,     # use FP16 on Colab / most GPUs
-        bf16=False,    # do NOT use BF16 on T4-type GPUs
+        save_steps=500,              # or even 200 if you want
+        save_total_limit=3,          # keep last 3 checkpoints
+        fp16=False,
+        bf16=True,
         optim="paged_adamw_8bit",
         lr_scheduler_type="cosine",
-        report_to="none",       # or "wandb"
+        report_to="none",
+        max_grad_norm=cfg.max_grad_norm,
     )
+
+        # Try to resume if a checkpoint exists
+    last_checkpoint = None
+    if os.path.isdir(cfg.output_dir):
+        from transformers.trainer_utils import get_last_checkpoint
+        last_checkpoint = get_last_checkpoint(cfg.output_dir)
 
     trainer = Trainer(
         model=model,
@@ -228,12 +235,14 @@ def main():
         data_collator=data_collator,
     )
 
-    trainer.train()
+    trainer.train(resume_from_checkpoint=last_checkpoint)
+
 
     # Save adapter and tokenizer
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
     print("Saved LoRA adapter + tokenizer to", cfg.output_dir)
+    
 
 
 if __name__ == "__main__":
