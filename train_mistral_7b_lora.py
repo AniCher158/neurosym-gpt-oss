@@ -141,6 +141,7 @@ def main():
         cfg.base_model_name,
         quantization_config=bnb_config,
         device_map={"": 0},  # single A100: avoid weird splits
+        attn_implementation="flash_attention_2",  # requires flash-attn installed
     )
     model.config.use_cache = False  # required for training
 
@@ -260,4 +261,17 @@ def main():
 
 
 if __name__ == "__main__":
+    import argparse
+
+    p = argparse.ArgumentParser()
+    p.add_argument("--train_path", type=str, default=None)
+    p.add_argument("--output_dir", type=str, default=None)
+    args = p.parse_args()
+
+    cfg = LoRAConfig()
+    if args.train_path:
+        cfg.train_path = args.train_path
+    if args.output_dir:
+        cfg.output_dir = args.output_dir
+
     main()
