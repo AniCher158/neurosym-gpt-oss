@@ -1,10 +1,7 @@
 import os
-import json
 from dataclasses import dataclass
 
 import torch
-from torch.utils.data import Dataset
-
 from datasets import load_dataset
 from transformers import (
     AutoModelForCausalLM,
@@ -14,29 +11,26 @@ from transformers import (
     TrainingArguments,
     DataCollatorForLanguageModeling,
 )
-
 from peft import LoraConfig, get_peft_model
 
 
-# ----------------------------
-# 1. Training configuration
-# ----------------------------
+# ==========================
+# 1. Config
+# ==========================
 
 @dataclass
-@dataclass
-class TrainConfig:
+class LoRAConfig:
+    # Paths / model
     base_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"
     train_path: str = "data/neurosym_mix_train.jsonl"
-    output_dir: str = "/content/drive/MyDrive/neurosym_mistral_lora"
+    output_dir: str = "outputs/mistral7b_neurosym_lora"
 
+    # Sequence / batch
+    max_seq_len: int = 2048          # longer context
+    per_device_batch_size: int = 2   # increase vs before (A100 should handle this with 4-bit)
+    gradient_accumulation_steps: int = 4
 
-    # On g5.xlarge, 2048 is usually OK with QLoRA 4-bit
-    max_seq_len: int = 2048
-
-    # Try batch 2 with some accumulation.
-    per_device_batch_size: int = 2
-    gradient_accumulation_steps: int = 8  # effective batch = 16
-
+    # Optim / schedule
     learning_rate: float = 2e-4
     num_train_epochs: int = 3
     warmup_ratio: float = 0.03
@@ -45,98 +39,55 @@ class TrainConfig:
     save_steps: int = 500
     max_grad_norm: float = 1.0
 
+    # LoRA
+    lora_r: int = 32          # larger than before
+    lora_alpha: int = 64      # larger than before
+    lora_dropout: float = 0.05
 
-# ----------------------------
-# 2. Prompt formatting
-# ----------------------------
 
-def format_messages(example):
+# ==========================
+# 2. Dataset / tokenization
+# ==========================
+
+def build_chat_text(example, tokenizer, add_generation_prompt: bool = False):
     """
-    Convert the messages list into a single training string.
-    Very simple chat-style format.
+    Convert your {"messages": [...]} into a single Mistral chat string
+    using the HF chat template.
+
+    Each example["messages"] is expected to be a list of dicts like:
+      {"role": "system"|"user"|"assistant", "content": "..."}
     """
     msgs = example["messages"]
-
-    lines = []
-    for turn in msgs:
-        role = turn["role"]
-        content = (turn["content"] or "").strip()
-        if not content:
-            continue
-
-        if role == "system":
-            lines.append(f"<|system|>\n{content}\n")
-        elif role == "user":
-            lines.append(f"<|user|>\n{content}\n")
-        elif role == "assistant":
-            lines.append(f"<|assistant|>\n{content}\n")
-        else:
-            lines.append(f"<|{role}|>\n{content}\n")
-
-    joined = "\n".join(lines).strip() + "\n"
-    return joined
+    text = tokenizer.apply_chat_template(
+        msgs,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    return {"text": text}
 
 
-# ----------------------------
-# 3. Dataset wrapper
-# ----------------------------
-
-class ChatJSONLDataset(Dataset):
-    def __init__(self, path, tokenizer, max_seq_len: int):
-        self.tokenizer = tokenizer
-        self.max_seq_len = max_seq_len
-
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Train JSONL not found at: {path}")
-
-        # Load JSONL with datasets
-        self.ds = load_dataset("json", data_files={"train": path})["train"]
-        print(f"Loaded {len(self.ds)} examples from {path}")
-
-    def __len__(self):
-        return len(self.ds)
-
-    def __getitem__(self, idx):
-        row = self.ds[idx]
-        text = format_messages(row)
-
-        tokenized = self.tokenizer(
-            text,
-            truncation=True,
-            max_length=self.max_seq_len,
-            padding="max_length",
-            return_tensors="pt",
-        )
-
-        input_ids = tokenized["input_ids"][0]
-        attention_mask = tokenized["attention_mask"][0]
-
-        # Plain causal LM: labels = input_ids
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "labels": input_ids.clone(),
-        }
+def tokenize_function(batch, tokenizer, max_seq_len: int):
+    return tokenizer(
+        batch["text"],
+        truncation=True,
+        max_length=max_seq_len,
+        padding=False,        # dynamic padding via collator
+    )
 
 
-# ----------------------------
-# 4. Main training function
-# ----------------------------
+# ==========================
+# 3. Main training
+# ==========================
 
 def main():
-    cfg = TrainConfig()
+    cfg = LoRAConfig()
 
-    # Small memory tweaks
-    torch.backends.cuda.matmul.allow_tf32 = True
-
-    # QLoRA 4-bit config
-    # IMPORTANT: use float16 here (bfloat16 on T4/Colab is bad for memory
-    # and not fully supported).
+    # ----- 3.1 BitsAndBytes 4-bit (QLoRA) -----
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_compute_dtype=torch.bfloat16,  # consistent with bf16 training on A100
     )
 
     print("Loading base model:", cfg.base_model_name)
@@ -144,30 +95,23 @@ def main():
         cfg.base_model_name,
         quantization_config=bnb_config,
         device_map="auto",
-        trust_remote_code=True,
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
         cfg.base_model_name,
         use_fast=True,
-        trust_remote_code=True,
     )
 
-    # Mistral expects a pad token; if missing, set it to eos
+    # Mistral tokenizer usually has special chat tokens; we just need a pad token
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+        model.resize_token_embeddings(len(tokenizer))
 
-    # Optional: ensure embeddings match tokenizer size
-    model.resize_token_embeddings(len(tokenizer))
-
-    # ------------------------
-    # LoRA configuration
-    # ------------------------
-    # Larger r and lora_alpha than your previous version (more capacity).
+    # ----- 3.2 LoRA config -----
     lora_cfg = LoraConfig(
-        r=32,              # was 16
-        lora_alpha=64,     # was 32
-        lora_dropout=0.05,
+        r=cfg.lora_r,
+        lora_alpha=cfg.lora_alpha,
+        lora_dropout=cfg.lora_dropout,
         bias="none",
         task_type="CAUSAL_LM",
         target_modules=[
@@ -184,25 +128,51 @@ def main():
     model = get_peft_model(model, lora_cfg)
     model.print_trainable_parameters()
 
-    # Enable gradient checkpointing to save memory
-    model.gradient_checkpointing_enable()
-    model.config.use_cache = False  # mandatory when using gradient checkpointing
+    # ----- 3.3 Load + pre-tokenize dataset -----
+    if not os.path.exists(cfg.train_path):
+        raise FileNotFoundError(f"Training file not found: {cfg.train_path}")
 
-    # Dataset
-    train_dataset = ChatJSONLDataset(
-        path=cfg.train_path,
-        tokenizer=tokenizer,
-        max_seq_len=cfg.max_seq_len,
+    print(f"Loading JSONL from: {cfg.train_path}")
+    raw_ds = load_dataset("json", data_files={"train": cfg.train_path})["train"]
+    print("Raw examples:", len(raw_ds))
+
+    # 1) Build chat strings using Mistral's chat template
+    def _build_chat_wrapper(example):
+        return build_chat_text(example, tokenizer, add_generation_prompt=False)
+
+    ds_with_text = raw_ds.map(
+        _build_chat_wrapper,
+        desc="Applying chat template",
     )
 
+    # 2) Tokenize once, batched, without padding; dynamic padding later
+    def _tok_wrapper(batch):
+        return tokenize_function(batch, tokenizer, max_seq_len=cfg.max_seq_len)
+
+    tokenized_ds = ds_with_text.map(
+        _tok_wrapper,
+        batched=True,
+        remove_columns=ds_with_text.column_names,  # keep only input_ids, attention_mask
+        desc="Tokenizing",
+    )
+
+    tokenized_ds.set_format(
+        type="torch",
+        columns=["input_ids", "attention_mask"],
+    )
+
+    print("Tokenized dataset length:", len(tokenized_ds))
+
+    # ----- 3.4 Data collator (dynamic padding + label masking) -----
     data_collator = DataCollatorForLanguageModeling(
         tokenizer=tokenizer,
-        mlm=False,
+        mlm=False,                # causal LM
     )
 
-    # ------------------------
-    # Training arguments
-    # ------------------------
+    # ----- 3.5 TrainingArguments -----
+    total_batch_size = cfg.per_device_batch_size * cfg.gradient_accumulation_steps
+    print(f"Effective batch size per step: {total_batch_size} sequences")
+
     training_args = TrainingArguments(
         output_dir=cfg.output_dir,
         per_device_train_batch_size=cfg.per_device_batch_size,
@@ -212,37 +182,32 @@ def main():
         warmup_ratio=cfg.warmup_ratio,
         weight_decay=cfg.weight_decay,
         logging_steps=cfg.logging_steps,
-        save_steps=500,              # or even 200 if you want
-        save_total_limit=3,          # keep last 3 checkpoints
-        fp16=False,
-        bf16=True,
-        optim="paged_adamw_8bit",
-        lr_scheduler_type="cosine",
-        report_to="none",
+        save_steps=cfg.save_steps,
         max_grad_norm=cfg.max_grad_norm,
+        lr_scheduler_type="cosine",
+        optim="paged_adamw_8bit",
+
+        bf16=True,    # A100: use bfloat16
+        fp16=False,
+
+        report_to="none",  # or "wandb"
+        dataloader_num_workers=2,
     )
 
-        # Try to resume if a checkpoint exists
-    last_checkpoint = None
-    if os.path.isdir(cfg.output_dir):
-        from transformers.trainer_utils import get_last_checkpoint
-        last_checkpoint = get_last_checkpoint(cfg.output_dir)
-
+    # ----- 3.6 Trainer -----
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
+        train_dataset=tokenized_ds,
         data_collator=data_collator,
     )
 
-    trainer.train(resume_from_checkpoint=last_checkpoint)
+    trainer.train()
 
-
-    # Save adapter and tokenizer
+    # ----- 3.7 Save adapter + tokenizer -----
     trainer.save_model(cfg.output_dir)
     tokenizer.save_pretrained(cfg.output_dir)
     print("Saved LoRA adapter + tokenizer to", cfg.output_dir)
-    
 
 
 if __name__ == "__main__":
