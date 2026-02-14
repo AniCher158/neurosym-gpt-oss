@@ -22,8 +22,8 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 @dataclass
 class LoRAConfig:
     base_model_name: str = "mistralai/Mistral-7B-Instruct-v0.2"
-    train_path: str = "data/neurosym_mix_train.jsonl"
-    output_dir: str = "outputs/mistral7b_neurosym_lora_fast"
+    train_path: str = "/content/drive/MyDrive/neurosym/train_mixed.jsonl"
+    output_dir: str = "/content/drive/MyDrive/neurosym/outputs/mistral_lora_run1"
 
     max_seq_len: int = 2048
     per_device_batch_size: int = 2
